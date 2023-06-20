@@ -8,6 +8,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .checkpoint_utils import checkpoint
 from .nn import avg_pool_nd, conv_nd, linear, normalization, timestep_embedding, zero_module, get_activation, \
     AttentionPooling
 
@@ -138,6 +139,7 @@ class ResBlock(TimestepBlock):
             dtype=None,
             efficient_activation=False,
             scale_skip_connection=False,
+            use_checkpoint: bool = False
     ):
         super().__init__()
         self.dtype = dtype
@@ -149,6 +151,7 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
         self.efficient_activation = efficient_activation
         self.scale_skip_connection = scale_skip_connection
+        self.use_checkpoint = use_checkpoint
 
         self.in_layers = nn.Sequential(
             normalization(channels, dtype=self.dtype),
@@ -190,6 +193,11 @@ class ResBlock(TimestepBlock):
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1, dtype=self.dtype)
 
     def forward(self, x, emb):
+        return checkpoint(
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        )
+
+    def _forward(self, x, emb):
         """
         Apply the block to a Tensor, conditioned on a timestep embedding.
         :param x: an [N x C x ...] Tensor of features.
@@ -237,11 +245,13 @@ class AttentionBlock(nn.Module):
             disable_self_attention=False,
             encoder_channels=None,
             dtype=None,
+            use_checkpoint: bool = False
     ):
         super().__init__()
         self.dtype = dtype
         self.channels = channels
         self.disable_self_attention = disable_self_attention
+        self.use_checkpoint = use_checkpoint
         if num_head_channels == -1:
             self.num_heads = num_heads
         else:
@@ -263,6 +273,9 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1, dtype=self.dtype))
 
     def forward(self, x, encoder_out=None):
+        return checkpoint(self._forward, (x, encoder_out,), self.parameters(), self.use_checkpoint)
+
+    def _forward(self, x, encoder_out=None):
         b, c, *spatial = x.shape
         qkv = self.qkv(self.norm(x).view(b, c, -1))
         if encoder_out is not None:
@@ -376,6 +389,7 @@ class UNetModel(nn.Module):
             resblock_updown=False,
             efficient_activation=False,
             scale_skip_connection=False,
+            use_checkpoint: bool = False
     ):
         super().__init__()
 
@@ -390,6 +404,8 @@ class UNetModel(nn.Module):
         self.model_channels = model_channels
         self.out_channels = out_channels
         self.dropout = dropout
+
+        self.use_checkpoint = use_checkpoint
 
         # adapt attention resolutions
         if isinstance(attention_resolutions, str):
@@ -473,6 +489,7 @@ class UNetModel(nn.Module):
                         activation=activation,
                         efficient_activation=self.efficient_activation,
                         scale_skip_connection=self.scale_skip_connection,
+                        use_checkpoint=use_checkpoint
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -485,6 +502,7 @@ class UNetModel(nn.Module):
                             encoder_channels=encoder_channels,
                             dtype=self.dtype,
                             disable_self_attention=ds in self.disable_self_attentions,
+                            use_checkpoint=use_checkpoint
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -506,6 +524,7 @@ class UNetModel(nn.Module):
                             activation=activation,
                             efficient_activation=self.efficient_activation,
                             scale_skip_connection=self.scale_skip_connection,
+                            use_checkpoint=use_checkpoint
                         )
                         if resblock_updown
                         else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
@@ -527,6 +546,7 @@ class UNetModel(nn.Module):
                 activation=activation,
                 efficient_activation=self.efficient_activation,
                 scale_skip_connection=self.scale_skip_connection,
+                use_checkpoint=use_checkpoint
             ),
             AttentionBlock(
                 ch,
@@ -535,6 +555,7 @@ class UNetModel(nn.Module):
                 encoder_channels=encoder_channels,
                 dtype=self.dtype,
                 disable_self_attention=ds in self.disable_self_attentions,
+                use_checkpoint=use_checkpoint
             ),
             ResBlock(
                 ch,
@@ -546,6 +567,7 @@ class UNetModel(nn.Module):
                 activation=activation,
                 efficient_activation=self.efficient_activation,
                 scale_skip_connection=self.scale_skip_connection,
+                use_checkpoint=use_checkpoint
             ),
         )
         self._feature_size += ch
@@ -566,6 +588,7 @@ class UNetModel(nn.Module):
                         activation=activation,
                         efficient_activation=self.efficient_activation,
                         scale_skip_connection=self.scale_skip_connection,
+                        use_checkpoint=use_checkpoint
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -578,6 +601,7 @@ class UNetModel(nn.Module):
                             encoder_channels=encoder_channels,
                             dtype=self.dtype,
                             disable_self_attention=ds in self.disable_self_attentions,
+                            use_checkpoint=use_checkpoint
                         )
                     )
                 if level and i == num_res_blocks[level]:
@@ -595,6 +619,7 @@ class UNetModel(nn.Module):
                             activation=activation,
                             efficient_activation=self.efficient_activation,
                             scale_skip_connection=self.scale_skip_connection,
+                            use_checkpoint=use_checkpoint
                         )
                         if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
