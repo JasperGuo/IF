@@ -1,7 +1,8 @@
 import torch
+from torch.utils.checkpoint import _checkpoint_without_reentrant
 
 
-def checkpoint(func, inputs, params, flag):
+def checkpoint(func, inputs, params, flag, use_reentrant: bool = True):
     """
     Evaluate a function without caching intermediate activations, allowing for
     reduced memory at the expense of extra compute in the backward pass.
@@ -13,7 +14,10 @@ def checkpoint(func, inputs, params, flag):
     """
     if flag: # disabled checkpointing to allow requires_grad = False for main model
         args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
+        if use_reentrant:
+            return CheckpointFunction.apply(func, len(inputs), *args)
+        else:
+            return _checkpoint_without_reentrant(func, True, *tuple(inputs))
     else:
         return func(*inputs)
 

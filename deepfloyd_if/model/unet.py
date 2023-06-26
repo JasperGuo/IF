@@ -139,7 +139,8 @@ class ResBlock(TimestepBlock):
             dtype=None,
             efficient_activation=False,
             scale_skip_connection=False,
-            use_checkpoint: bool = False
+            use_checkpoint: bool = False,
+            checkpoint_use_reentrant: bool = True
     ):
         super().__init__()
         self.dtype = dtype
@@ -151,7 +152,9 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
         self.efficient_activation = efficient_activation
         self.scale_skip_connection = scale_skip_connection
+        # gradient checkpointing
         self.use_checkpoint = use_checkpoint
+        self.checkpoint_use_reentrant = checkpoint_use_reentrant
 
         self.in_layers = nn.Sequential(
             normalization(channels, dtype=self.dtype),
@@ -194,7 +197,8 @@ class ResBlock(TimestepBlock):
 
     def forward(self, x, emb):
         return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+            self._forward, (x, emb), self.parameters(), self.use_checkpoint,
+            use_reentrant=self.checkpoint_use_reentrant
         )
 
     def _forward(self, x, emb):
@@ -245,13 +249,17 @@ class AttentionBlock(nn.Module):
             disable_self_attention=False,
             encoder_channels=None,
             dtype=None,
-            use_checkpoint: bool = False
+            use_checkpoint: bool = False,
+            checkpoint_use_reentrant: bool = True
     ):
         super().__init__()
         self.dtype = dtype
         self.channels = channels
         self.disable_self_attention = disable_self_attention
+        # Gradient checkpointing
         self.use_checkpoint = use_checkpoint
+        self.checkpoint_use_reentrant = checkpoint_use_reentrant
+
         if num_head_channels == -1:
             self.num_heads = num_heads
         else:
@@ -273,7 +281,10 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1, dtype=self.dtype))
 
     def forward(self, x, encoder_out=None):
-        return checkpoint(self._forward, (x, encoder_out,), self.parameters(), self.use_checkpoint)
+        return checkpoint(
+            self._forward, (x, encoder_out,), self.parameters(), self.use_checkpoint,
+            use_reentrant=self.checkpoint_use_reentrant
+        )
 
     def _forward(self, x, encoder_out=None):
         b, c, *spatial = x.shape
@@ -389,7 +400,8 @@ class UNetModel(nn.Module):
             resblock_updown=False,
             efficient_activation=False,
             scale_skip_connection=False,
-            use_checkpoint: bool = False
+            use_checkpoint: bool = False,
+            checkpoint_use_reentrant: bool = True
     ):
         super().__init__()
 
@@ -405,7 +417,9 @@ class UNetModel(nn.Module):
         self.out_channels = out_channels
         self.dropout = dropout
 
+        # Gradient checkpointing
         self.use_checkpoint = use_checkpoint
+        self.checkpoint_use_reentrant = checkpoint_use_reentrant
 
         # adapt attention resolutions
         if isinstance(attention_resolutions, str):
@@ -489,7 +503,8 @@ class UNetModel(nn.Module):
                         activation=activation,
                         efficient_activation=self.efficient_activation,
                         scale_skip_connection=self.scale_skip_connection,
-                        use_checkpoint=use_checkpoint
+                        use_checkpoint=use_checkpoint,
+                        checkpoint_use_reentrant=self.checkpoint_use_reentrant
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -502,7 +517,8 @@ class UNetModel(nn.Module):
                             encoder_channels=encoder_channels,
                             dtype=self.dtype,
                             disable_self_attention=ds in self.disable_self_attentions,
-                            use_checkpoint=use_checkpoint
+                            use_checkpoint=use_checkpoint,
+                            checkpoint_use_reentrant=self.checkpoint_use_reentrant
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -524,7 +540,8 @@ class UNetModel(nn.Module):
                             activation=activation,
                             efficient_activation=self.efficient_activation,
                             scale_skip_connection=self.scale_skip_connection,
-                            use_checkpoint=use_checkpoint
+                            use_checkpoint=use_checkpoint,
+                            checkpoint_use_reentrant=self.checkpoint_use_reentrant
                         )
                         if resblock_updown
                         else Downsample(ch, conv_resample, dims=dims, out_channels=out_ch)
@@ -546,7 +563,8 @@ class UNetModel(nn.Module):
                 activation=activation,
                 efficient_activation=self.efficient_activation,
                 scale_skip_connection=self.scale_skip_connection,
-                use_checkpoint=use_checkpoint
+                use_checkpoint=use_checkpoint,
+                checkpoint_use_reentrant=self.checkpoint_use_reentrant
             ),
             AttentionBlock(
                 ch,
@@ -555,7 +573,8 @@ class UNetModel(nn.Module):
                 encoder_channels=encoder_channels,
                 dtype=self.dtype,
                 disable_self_attention=ds in self.disable_self_attentions,
-                use_checkpoint=use_checkpoint
+                use_checkpoint=use_checkpoint,
+                checkpoint_use_reentrant=self.checkpoint_use_reentrant
             ),
             ResBlock(
                 ch,
@@ -567,7 +586,8 @@ class UNetModel(nn.Module):
                 activation=activation,
                 efficient_activation=self.efficient_activation,
                 scale_skip_connection=self.scale_skip_connection,
-                use_checkpoint=use_checkpoint
+                use_checkpoint=use_checkpoint,
+                checkpoint_use_reentrant=self.checkpoint_use_reentrant
             ),
         )
         self._feature_size += ch
@@ -588,7 +608,8 @@ class UNetModel(nn.Module):
                         activation=activation,
                         efficient_activation=self.efficient_activation,
                         scale_skip_connection=self.scale_skip_connection,
-                        use_checkpoint=use_checkpoint
+                        use_checkpoint=use_checkpoint,
+                        checkpoint_use_reentrant=self.checkpoint_use_reentrant
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -601,7 +622,8 @@ class UNetModel(nn.Module):
                             encoder_channels=encoder_channels,
                             dtype=self.dtype,
                             disable_self_attention=ds in self.disable_self_attentions,
-                            use_checkpoint=use_checkpoint
+                            use_checkpoint=use_checkpoint,
+                            checkpoint_use_reentrant=self.checkpoint_use_reentrant
                         )
                     )
                 if level and i == num_res_blocks[level]:
@@ -619,7 +641,8 @@ class UNetModel(nn.Module):
                             activation=activation,
                             efficient_activation=self.efficient_activation,
                             scale_skip_connection=self.scale_skip_connection,
-                            use_checkpoint=use_checkpoint
+                            use_checkpoint=use_checkpoint,
+                            checkpoint_use_reentrant=self.checkpoint_use_reentrant
                         )
                         if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)

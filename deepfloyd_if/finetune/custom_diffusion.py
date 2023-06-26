@@ -1,24 +1,25 @@
-from time import time
 from pathlib import Path
-from typing import Dict, List
-import argparse, logging, sys, math, itertools
+from typing import Dict, List, Tuple
+import argparse, logging, sys, itertools, math
 
 from tqdm import tqdm
 from PIL import Image
 from PIL.ImageOps import exif_transpose
-from accelerate.utils import set_seed
-from accelerate import Accelerator
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from torchvision import transforms as T
+from accelerate import Accelerator
+from accelerate.utils import set_seed
 from diffusers import get_scheduler
 import bitsandbytes as bnb
 
-from deepfloyd_if.pipelines import dream
 from deepfloyd_if.modules import T5Embedder, IFStageI
-from deepfloyd_if.finetune.utils import freeze_params, clean_cuda_cache
-from deepfloyd_if.finetune.lora import inject_trainable_lora, save_lora_weight
+from deepfloyd_if.finetune.utils import freeze_params
+from deepfloyd_if.finetune.textual_inversion import add_vtokens
+from deepfloyd_if.finetune.dreambooth import prepare_class_images
+from deepfloyd_if.finetune.lora import _find_modules, UNET_DEFAULT_TARGET_REPLACE
 
 
 logging.basicConfig(
@@ -32,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 def define_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--num-vtokens", type=int, default=1, help="number of vtokens")
+    parser.add_argument("--init-token", type=str, required=True, help="init token")
+
     parser.add_argument("--instance-prompt", type=str, required=True, help="instance prompt")
     parser.add_argument("--instance-data-root", type=str, required=True, help="instance data root")
     parser.add_argument("--class-data-root", type=str, required=True, help="class data root")
@@ -53,9 +57,6 @@ def define_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log_steps", type=int, default=50, help="number of steps to log graident & loss")
     parser.add_argument("--use_gradient_checkpoint", action='store_true', help="use gradient checkpoint")
     parser.add_argument("--use_8bitadam", action='store_true', help="whether to use 8bit adam (save memory)")
-    parser.add_argument("--lora", action='store_true', help="whether to train with lora")
-    parser.add_argument("--lora_r", type=int, default=4, help="lora rank")
-    parser.add_argument("--lora_scale", type=float, default=1.0, help="lora scale when merged with weights")
 
     # learning rate schduler
     parser.add_argument(
@@ -81,17 +82,15 @@ def define_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--report_to", type=str, default="wandb", help="experiment tracker")
 
 
-class DreamBoothDataset(Dataset):
+class CustomDiffusionDataset(Dataset):
 
     def __init__(
         self,
         instance_data_root: str,
         instance_prompt: str,
-        instance_prompt_encoder_states: torch.Tensor,
         tokenizer: AutoTokenizer,
         class_data_root: str,
         class_prompt: str,
-        class_prompt_encoder_states: torch.Tensor,
         size: int = 64,
         flip_p: float = 0.0 # Do not enable horizontal flip by default
     ) -> None:
@@ -103,13 +102,11 @@ class DreamBoothDataset(Dataset):
         self.instance_images_path = list(Path(instance_data_root).iterdir())
         self.num_instance_images = len(self.instance_images_path)
         self.instance_prompt = instance_prompt
-        self.instance_prompt_encoder_states = instance_prompt_encoder_states
 
         # Prior preservation
         self.class_images_path = list(Path(class_data_root).iterdir())
         self.num_class_images = len(self.class_images_path)
         self.class_prompt = class_prompt
-        self.class_prompt_encoder_states = class_prompt_encoder_states
 
         self.size = size
         self.flip_p = flip_p
@@ -132,16 +129,36 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_image"] = self.transforms(instance_image)
-        example["instance_prompt_embeds"] = self.instance_prompt_encoder_states
+        instance_prompt_tokens_and_mask = self.tokenizer(
+            self.instance_prompt,
+            max_length=77,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            add_special_tokens=True,
+            return_tensors='pt'
+        )
+        example['instance_input_ids'] = instance_prompt_tokens_and_mask['input_ids'][0]
+        example['instance_attention_mask'] = instance_prompt_tokens_and_mask['attention_mask'][0]
 
         # prior image
         class_image = Image.open(self.class_images_path[index % self.num_class_images])
         class_image = exif_transpose(class_image)
-
         if not class_image.mode == "RGB":
             class_image = class_image.convert("RGB")
         example["class_image"] = self.transforms(class_image)
-        example["class_prompt_embeds"] = self.class_prompt_encoder_states
+
+        class_prompt_tokens_and_mask = self.tokenizer(
+            self.class_prompt,
+            max_length=77,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            add_special_tokens=True,
+            return_tensors='pt'
+        )
+        example['class_input_ids'] = class_prompt_tokens_and_mask['input_ids'][0]
+        example['class_attention_mask'] = class_prompt_tokens_and_mask['attention_mask'][0]
 
         return example
 
@@ -152,89 +169,68 @@ def collate_fn(examples: List[Dict]) -> Dict:
     pixel_values = torch.stack(pixel_values)
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    embeds = [ex['instance_prompt_embeds'] for ex in examples]
-    embeds.extend([ex['class_prompt_embeds'] for ex in examples])
-    embeds = torch.stack(embeds)
+    input_ids = [ex['instance_input_ids'] for ex in examples]
+    input_ids.extend([ex['class_input_ids'] for ex in examples])
+    input_ids = torch.stack(input_ids)
+
+    attention_mask = [ex['instance_attention_mask'] for ex in examples]
+    attention_mask.extend([ex['class_attention_mask'] for ex in examples])
+    attention_mask = torch.stack(attention_mask)
 
     batch = {
-        "embeds": embeds,
-        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values
     }
     return batch
 
 
-def prepare_class_images(
-    class_data_root: str,
-    num_class_images: int, 
-    class_prompt: str,
-    t5: T5Embedder, 
-    if_I: IFStageI,
-) -> None:
-    root = Path(class_data_root)
-    root.mkdir(exist_ok=True, parents=True)
-    diff = num_class_images - len(list(root.iterdir()))
-    if diff <= 0:
-        return
+def find_crossattn_kv_parameters(model: nn.Module) -> Tuple[List, List[str]]:
+    require_grad_params = []
+    names = []
 
-    # inference
-    with torch.inference_mode():
-        for _ in tqdm(range(diff)):
-            result = dream(
-                t5=t5, if_I=if_I,
-                prompt=class_prompt,
-                if_I_kwargs={
-                    "guidance_scale": 7.0,
-                    "sample_timestep_respacing": "smart100",
-                },
-            )
-            result['I'][0].save(root / f"class_prior_{int(time())}.png")
-
-    # Clean memory
-    clean_cuda_cache()
+    for _module, name, _child_module in _find_modules(
+        model, UNET_DEFAULT_TARGET_REPLACE, search_class=[nn.Conv1d]
+    ):
+        if name != "encoder_kv":
+            continue
+        for param in _module._modules[name].parameters():
+            param.requires_grad = True
+        require_grad_params.append(_module._modules[name].parameters())
+        names.append(name)
+    return require_grad_params, names
 
 
-def get_text_encoder_states(t5: T5Embedder, prompt: str) -> torch.Tensor:
-    prompt_tokens_and_mask = t5.tokenizer(
-        prompt,
-        max_length=77,
-        padding='max_length',
-        truncation=True,
-        return_attention_mask=True,
-        add_special_tokens=True,
-        return_tensors='pt'
-    )
-    with torch.inference_mode():
-        embeds = t5.model(
-            input_ids=prompt_tokens_and_mask['input_ids'],
-            attention_mask=prompt_tokens_and_mask['attention_mask']
-        ).last_hidden_state.squeeze(dim=0)
-    return embeds
-
-
-def save_ckpt(accelerator: Accelerator, model, save_path: str, use_lora: bool = False) -> None:
+def save_ckpt(accelerator: Accelerator, model, text_encoder, save_path: str, vtoken_ids: List[int]) -> None:
+    logger.info(f"Saving unet: {save_path}")
     unet = accelerator.unwrap_model(model)
-    if not use_lora:
-        torch.save(unet, save_path)
-    else:
-        save_lora_weight(unet, save_path, dtype=torch.float32)
+    torch.save(unet, save_path)
+
+    logger.info(f"Saving vtoken embeddings: {save_path.replace('.bin', '-embeds.bin')}")
+    learned_embeds_dict = dict()
+    embeddings = accelerator.unwrap_model(text_encoder).get_input_embeddings()
+    for vid in vtoken_ids:
+        learned_embeds = embeddings.weight[vid]
+        learned_embeds_dict[vid] = learned_embeds.detach().cpu()
+    torch.save(learned_embeds_dict, save_path.replace(".bin", "-embeds.bin"))
 
 
 def main(args) -> None:
     set_seed(args.seed)
-    logger.info(f"Instance prompt: {args.instance_prompt}")
-    logger.info(f"Class prompt: {args.class_prompt}")
 
-    t5 = T5Embedder(device="cpu", torch_dtype=torch.float32, use_offload_folder=None)
-    freeze_params(t5.model.parameters())
-
+    t5 = T5Embedder(device=args.device, torch_dtype=torch.float32, use_offload_folder=None)
+    if args.use_gradient_checkpoint:
+        t5.model.gradient_checkpointing_enable()
     if_I = IFStageI(
         args.if_I, 
         device=args.device, 
         model_kwargs={
             "precision": 32, 
-            "use_checkpoint": args.use_gradient_checkpoint
+            "use_checkpoint": args.use_gradient_checkpoint,
+            "checkpoint_use_reentrant": False
         }
     )
+    # https://pytorch.org/docs/stable/_modules/torch/utils/checkpoint.html#checkpoint
     if_I.model.to(dtype=if_I.model.dtype)
 
     prepare_class_images(
@@ -244,18 +240,18 @@ def main(args) -> None:
         t5=t5, if_I=if_I
     )
 
-    # prepare dataset
-    instance_prompt_encoder_states = get_text_encoder_states(t5, args.instance_prompt)
-    class_prompt_encoder_states = get_text_encoder_states(t5, args.class_prompt)
+    # Add instance token
+    vtoken_seq, vtoken_ids = add_vtokens(t5, num_tokens=args.num_vtokens, init_token=args.init_token)
+    instance_prompt = args.instance_prompt.format(vtoken_seq)
+    logger.info(f"Instance prompt: {instance_prompt}")
+    logger.info(f"Class prompt: {args.class_prompt}")
 
-    dataset = DreamBoothDataset(
+    dataset = CustomDiffusionDataset(
         instance_data_root=args.instance_data_root,
-        instance_prompt=args.instance_prompt,
-        instance_prompt_encoder_states=instance_prompt_encoder_states,
+        instance_prompt=instance_prompt,
         tokenizer=t5.tokenizer,
         class_data_root=args.class_data_root,
         class_prompt=args.class_prompt,
-        class_prompt_encoder_states=class_prompt_encoder_states,
     )
     data_loader = DataLoader(
         dataset, 
@@ -267,37 +263,30 @@ def main(args) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if_I.model.train()
     # optimizers
     lr = args.lr
     if args.scale_lr:
         lr = lr * args.batch_size * args.gradient_accumulation_steps
+
     #  torch.optim.AdamW. Here, use 8bit Adam
     adamw_opt = bnb.optim.Adam8bit if args.use_8bitadam else torch.optim.AdamW
-    if args.lora:
-        logger.info(f"Trained with LoRA(r={args.lora_r}, scale={args.lora_scale})")
-        if_I.model.requires_grad_(False)
-        lora_trainable_parameters, lora_module_names = inject_trainable_lora(
-            if_I.model,
-            verbose=True,
-            r=args.lora_r,
-            scale=args.lora_scale
-        )
-        optimizer = adamw_opt(
-            itertools.chain(*lora_trainable_parameters), # only optimize the embeddings
-            lr=lr,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-            eps=1e-08
-        )
-    else:
-        optimizer = adamw_opt(
-            if_I.model.parameters(),  # only optimize the embeddings
-            lr=lr,
-            betas=(0.9, 0.999), 
-            weight_decay=1e-2,
-            eps=1e-08
-        )
+
+    t5.model = t5.model.train()
+    freeze_params(t5.model.encoder.parameters())
+    for param in t5.model.get_input_embeddings().parameters():
+        param.requires_grad = True
+
+    if_I.model.train()
+    freeze_params(if_I.model.parameters())
+    if_I_trainable_parameters, if_I_module_names = find_crossattn_kv_parameters(if_I.model)
+    logger.info(if_I_module_names)
+    optimizer = adamw_opt(
+        itertools.chain(*if_I_trainable_parameters, t5.model.get_input_embeddings().parameters()), # only optimize the embeddings
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-2,
+        eps=1e-08
+    )
 
     # learning rate scheduler
     lr_scheduler = get_scheduler(
@@ -313,9 +302,9 @@ def main(args) -> None:
         mixed_precision="fp16",
         log_with=args.report_to,
     )
-    accelerator.init_trackers("dreambooth", config=vars(args))
-    if_I.model, optimizer, data_loader, lr_scheduler = accelerator.prepare(
-        if_I.model, optimizer, data_loader, lr_scheduler
+    accelerator.init_trackers("custom_diffusion", config=vars(args))
+    t5.model, if_I.model, optimizer, data_loader, lr_scheduler = accelerator.prepare(
+        t5.model, if_I.model, optimizer, data_loader, lr_scheduler
     )
 
     total_batch_size = args.batch_size * args.gradient_accumulation_steps
@@ -341,13 +330,21 @@ def main(args) -> None:
         'guidance_scale': 7.0
     }
 
+    # keep original embeddings as reference
+    orig_embeds_params = accelerator.unwrap_model(t5.model).get_input_embeddings().weight.data.clone()
+
     for epoch in range(num_train_epochs):
+        t5.model.train()
         if_I.model.train()
         for step, batch in enumerate(data_loader):
             with accelerator.accumulate(if_I.model):
-                bsz = batch['embeds'].size(0)
+                bsz = batch['input_ids'].size(0)
+                embeds = t5.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                ).last_hidden_state
+                if_I_kwargs['text_emb'] = embeds
                 timesteps = torch.randint(low=1, high=num_timesteps-1, size=(bsz,)).to(if_I.device)
-                if_I_kwargs['text_emb'] = batch['embeds']
                 loss = diffusion.training_losses(
                     if_I.model, 
                     batch['pixel_values'],
@@ -360,12 +357,21 @@ def main(args) -> None:
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
+                # Let's make sure we don't update any embedding weights besides the newly added token
+                index_no_updates = batch['input_ids'].new_ones((len(t5.tokenizer),), dtype=torch.bool)
+                index_no_updates[min(vtoken_ids) : max(vtoken_ids) + 1] = False
+
+                with torch.no_grad():
+                    accelerator.unwrap_model(t5.model).get_input_embeddings().weight[
+                        index_no_updates
+                    ] = orig_embeds_params[index_no_updates]
+
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
                 if global_step % args.save_steps == 0:
                     save_path = out_dir / f"unet-step-{global_step}.bin"
-                    save_ckpt(accelerator, if_I.model, save_path, use_lora=args.lora)
+                    save_ckpt(accelerator, if_I.model, t5.model, save_path, vtoken_ids)
                     logger.info(f"Saved state to {save_path}")
                 if global_step % args.log_steps == 0:
                     logger.info(f"[Step {global_step}] Loss: {loss.detach().item()}")
