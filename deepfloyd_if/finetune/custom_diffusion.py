@@ -206,13 +206,13 @@ def save_ckpt(accelerator: Accelerator, model, text_encoder, save_path: str, vto
     unet = accelerator.unwrap_model(model)
     torch.save(unet, save_path)
 
-    logger.info(f"Saving vtoken embeddings: {save_path.replace('.bin', '-embeds.bin')}")
+    logger.info(f"Saving vtoken embeddings: {str(save_path).replace('.bin', '-embeds.bin')}")
     learned_embeds_dict = dict()
     embeddings = accelerator.unwrap_model(text_encoder).get_input_embeddings()
     for vid in vtoken_ids:
         learned_embeds = embeddings.weight[vid]
         learned_embeds_dict[vid] = learned_embeds.detach().cpu()
-    torch.save(learned_embeds_dict, save_path.replace(".bin", "-embeds.bin"))
+    torch.save(learned_embeds_dict, str(save_path).replace(".bin", "-embeds.bin"))
 
 
 def main(args) -> None:

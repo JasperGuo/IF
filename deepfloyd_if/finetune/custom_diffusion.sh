@@ -14,8 +14,8 @@ python ./finetune/custom_diffusion.py \
 --num-class-images 200 \
 --batch-size 1 \
 --if-I IF-I-XL-v1.0 \
---max_train_steps 2000 \
---save_steps 200 \
+--max_train_steps 5000 \
+--save_steps 500 \
 --gradient_accumulation_steps 4 \
 --lr 1e-7 \
 --output_dir ${OUT_DIR} \
