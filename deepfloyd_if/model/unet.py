@@ -275,6 +275,7 @@ class AttentionBlock(nn.Module):
             self.qkv = conv_nd(1, channels, channels * 3, 1, dtype=self.dtype)
         self.attention = QKVAttention(self.num_heads, disable_self_attention=disable_self_attention)
 
+        self.encoder_channels = encoder_channels
         if encoder_channels is not None:
             self.encoder_kv = conv_nd(1, encoder_channels, channels * 2, 1, dtype=self.dtype)
             self.norm_encoder = normalization(encoder_channels, dtype=self.dtype)

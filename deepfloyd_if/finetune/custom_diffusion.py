@@ -45,7 +45,7 @@ def define_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=42, help="seed")
     parser.add_argument("--batch-size", type=int, required=True, help="batch size for training")
     parser.add_argument("--device", type=str, default="cuda:0", help="device to train")
-    parser.add_argument("--if-I", type=str, default="IF-II-M-v1.0", help="IF-I model name")
+    parser.add_argument("--if-I", type=str, default="IF-I-M-v1.0", help="IF-I model name")
     parser.add_argument("--output_dir", type=str, required=True, help="output dir to store learned embeddings")
 
     # training hyper-parameters

@@ -4,7 +4,7 @@ INSTANCE_DATA_DIR=$1
 CLASS_DATA_DIR=$2
 OUT_DIR=$3
 
-python ./finetune/custom_diffusion.py \
+python ./finetune/adapter_diffusion.py \
 --num-vtokens 1 \
 --init-token "my" \
 --instance-prompt "a photo of a {} doll, white background" \
@@ -21,4 +21,6 @@ python ./finetune/custom_diffusion.py \
 --output_dir ${OUT_DIR} \
 --report_to wandb \
 --use_gradient_checkpoint \
---use_8bitadam
+--use_8bitadam \
+--bottleneck_r 2 \
+--adapter_scale 1.0
