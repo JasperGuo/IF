@@ -30,6 +30,12 @@ class TimestepBlock(nn.Module):
         """
 
 
+class AttentionAdapterVariant:
+    @abstractmethod
+    def forward(self, x, encoder_out=None):
+        pass
+
+
 class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
     A sequential module that passes timestep embeddings to the children that
@@ -40,7 +46,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
-            elif isinstance(layer, AttentionBlock):
+            elif isinstance(layer, AttentionBlock) or isinstance(layer, AttentionAdapterVariant):
                 x = layer(x, encoder_out)
             else:
                 x = layer(x)

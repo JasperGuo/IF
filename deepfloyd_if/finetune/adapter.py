@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from deepfloyd_if.model.nn import get_activation
-from deepfloyd_if.model.unet import AttentionBlock, UNetModel
+from deepfloyd_if.model.unet import AttentionBlock, UNetModel, AttentionAdapterVariant
 
 
 def _copy_conv_weights(conv: nn.Module, ref_conv: nn.Module) -> None:
@@ -37,6 +37,9 @@ class BottleneckAdapter(nn.Module):
             self.up_weight = nn.Parameter(torch.zeros(self.channels, self.bottleneck_channels, 1, dtype=self.dtype), requires_grad=True)
             self.up_bias = nn.Parameter(torch.zeros(self.channels, dtype=self.dtype), requires_grad=True)
             nn.init.kaiming_normal_(self.down_weight, a=math.sqrt(5))
+            nn.init.zeros_(self.down_bias)
+            nn.init.zeros_(self.up_weight)
+            nn.init.zeros_(self.up_bias)
         else:
             # copy the weights & bias
             self.down_weight = ref_adapter.down_weight
@@ -51,7 +54,7 @@ class BottleneckAdapter(nn.Module):
         return h
 
 
-class AdapterAttentionBlock(nn.Module):
+class AdapterAttentionBlock(nn.Module, AttentionAdapterVariant):
 
     def __init__(
         self,
