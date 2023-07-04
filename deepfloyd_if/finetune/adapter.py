@@ -1,5 +1,5 @@
-import math, re
 from typing import List
+import math, re, logging
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from deepfloyd_if.model.nn import get_activation
 from deepfloyd_if.model.unet import AttentionBlock, UNetModel, AttentionAdapterVariant
 
+
+logger = logging.getLogger(__name__)
 
 def _copy_conv_weights(conv: nn.Module, ref_conv: nn.Module) -> None:
     conv.weight = ref_conv.weight
@@ -74,26 +76,50 @@ class AdapterAttentionBlock(nn.Module, AttentionAdapterVariant):
         return y.reshape(b, c, *spatial) * self.adapter_scale + h
 
 
-def inject_adapter(model: UNetModel, bottlenect_r: int = 2, adapter_scale: float = 1.0) -> List:
+def inject_adapter(
+    model: UNetModel, 
+    bottleneck_r: int = 2,
+    bottleneck_channels: int = -1,
+    adapter_scale: float = 1.0,
+    share_adapter: bool = False # share adapter in each blcok (each block has #res_layers cross-attention)
+) -> List:
     require_grad_params = []
+    adapter_map = dict()
 
     adapter_attn_blocks = list()
     for fullname, module in model.named_modules():
         if module.__class__.__name__ == "AttentionBlock":
             # replace it
-            adapter = BottleneckAdapter(
-                channels=module.channels,
-                bottleneck_channels=module.channels // bottlenect_r,
-                dtype=module.dtype,
-                ref_adapter=None
-            )
+            if bottleneck_channels == -1:
+                bottleneck_channels = module.channels // bottleneck_r
+            adapter_key = f'{fullname.split(".")[0]}-{module.channels}'
+            logger.info(f"Name: {adapter_key}, Adapter-Down: {module.channels}, Bottleneck: {bottleneck_channels}, Up: {module.channels}, Shared: {share_adapter}")
+            if share_adapter:
+                if adapter_key in adapter_map:
+                    adapter = adapter_map[adapter_key]
+                else:
+                    adapter = BottleneckAdapter(
+                        channels=module.channels,
+                        bottleneck_channels=bottleneck_channels,
+                        dtype=module.dtype,
+                        ref_adapter=None
+                    )
+                    adapter_map[adapter_key] = adapter
+                    require_grad_params.append(adapter.parameters())
+            else:
+                adapter = BottleneckAdapter(
+                    channels=module.channels,
+                    bottleneck_channels=bottleneck_channels,
+                    dtype=module.dtype,
+                    ref_adapter=None
+                )
+                require_grad_params.append(adapter.parameters())
+
             adapter_attn_block = AdapterAttentionBlock(
                 attn_block=module,
                 adapter_block=adapter,
                 adapter_scale=adapter_scale
             )
-            # replace the module
-            require_grad_params.append(adapter.parameters())
             adapter_attn_blocks.append((fullname, adapter_attn_block,))
     for fn, aab in adapter_attn_blocks:
         m = model

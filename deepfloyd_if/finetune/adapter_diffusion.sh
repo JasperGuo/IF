@@ -23,4 +23,6 @@ python ./finetune/adapter_diffusion.py \
 --use_gradient_checkpoint \
 --use_8bitadam \
 --bottleneck_r 2 \
---adapter_scale 1.0
+--bottleneck_channels 4 \
+--adapter_scale 1.0 \
+--share_adapter

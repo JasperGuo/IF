@@ -19,8 +19,10 @@ from deepfloyd_if.finetune.custom_diffusion import define_args, \
 
 def define_adapter_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bottleneck_r", type=int, default=2, required=False, help="adapter bottleneck rank")
+    parser.add_argument("--bottleneck_channels", type=int, default=-1, required=False, help="bottleneck channels")
     parser.add_argument("--adapter_scale", type=float, default=1.0, required=False, 
                         help="adapter scale, controling the strength of the adapter")
+    parser.add_argument("--share_adapter", action='store_true', help="whether to share adapter in each down/up block")
 
 
 logging.basicConfig(
@@ -98,9 +100,12 @@ def main(args) -> None:
     freeze_params(if_I.model.parameters())
     if_I_trainable_parameters = inject_adapter(
         if_I.model,
-        bottlenect_r=args.bottleneck_r,
-        adapter_scale=args.adapter_scale
+        bottleneck_r=args.bottleneck_r,
+        bottleneck_channels=args.bottleneck_channels,
+        adapter_scale=args.adapter_scale,
+        share_adapter=args.share_adapter
     )
+    print(if_I_trainable_parameters)
     optimizer = adamw_opt(
         itertools.chain(*if_I_trainable_parameters, t5.model.get_input_embeddings().parameters()), # only optimize the embeddings
         lr=lr,
